@@ -13,6 +13,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 BASE = Path(__file__).parent
@@ -40,6 +41,8 @@ AMT_RE = re.compile(r"Tk\.?\s*([\d,]+(?:\.\d{1,2})?)", re.I)
 FROM_RE = re.compile(r"from\s*(01\d{9})", re.I)
 
 app = FastAPI(title="PayWatch")
+(BASE / "static").mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 security = HTTPBasic()
 
 
@@ -242,6 +245,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hind Siligu
 .top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;flex-wrap:wrap;gap:10px}
 .top h1{font-size:26px;font-weight:800}
 .top p{color:var(--mut);font-size:14px;margin-top:4px}
+.snd{border:1.5px solid var(--line);background:#fff;border-radius:999px;padding:9px 16px;font-size:13px;font-weight:700;cursor:pointer;color:var(--mut)}
+.snd.on{border-color:var(--pink);color:var(--pink)}
 .live{display:inline-flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:9px 16px;font-size:13px;font-weight:600}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--green);animation:pulse 1.6s infinite;display:inline-block}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(30,158,87,.5)}70%{box-shadow:0 0 0 8px rgba(30,158,87,0)}100%{box-shadow:0 0 0 0 rgba(30,158,87,0)}}
@@ -302,7 +307,10 @@ tr:last-child td{border-bottom:0}
   <main class="main">
     <div class="top">
       <div><h1>Payment Dashboard</h1><p id="dateLine">—</p></div>
-      <div class="live"><span class="dot"></span> LIVE</div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button id="soundBtn" class="snd on" onclick="toggleSound()">🔔 Sound ON</button>
+        <div class="live"><span class="dot"></span> LIVE</div>
+      </div>
     </div>
 
     <div class="stats">
@@ -399,6 +407,12 @@ async function load(){
     const tb=document.getElementById('rows');
     document.getElementById('emptyRow').style.display=j.payments.length?'none':'block';
     tb.innerHTML=j.payments.map(p=>'<tr><td><span class="pill">'+esc(p.trxid)+'</span></td><td class="amtcell">'+fmtAmt(p.amount)+' Tk</td><td>'+esc(p.sender_number||'–')+'</td><td style="color:var(--mut)">'+esc(p.received_at)+'</td></tr>').join('');
+    const top = j.payments.length ? j.payments[0].trxid : null;
+    if(lastTopTrx !== null && top && top !== lastTopTrx){
+      const np = j.payments.find(function(p){return p.trxid===top});
+      if(np) notifyPayment(np);
+    }
+    lastTopTrx = top;
   }catch(e){}
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
@@ -411,6 +425,40 @@ async function loadDaily(){
     tb.innerHTML=j.days.map(d=>'<tr><td>'+fmtDate(d.date)+'</td><td>'+d.count+' ta</td><td class="amtcell">'+fmtAmt(d.amount)+' Tk</td></tr>').join('');
   }catch(e){}
 }
+let soundOn = localStorage.getItem('pw_sound') !== 'off';
+let lastTopTrx = null;
+let audioEl = null;
+function ensureAudio(){
+  if(!audioEl){ audioEl = new Audio('/static/notify.mp3'); audioEl.preload='auto'; }
+}
+document.addEventListener('pointerdown', ensureAudio, {once:true});
+function paintSoundBtn(){
+  const b=document.getElementById('soundBtn');
+  b.textContent = soundOn ? '🔔 Sound ON' : '🔕 Sound OFF';
+  b.className = 'snd' + (soundOn ? ' on' : '');
+}
+function toggleSound(){
+  soundOn = !soundOn;
+  localStorage.setItem('pw_sound', soundOn ? 'on' : 'off');
+  paintSoundBtn();
+  if(soundOn){ ensureAudio(); audioEl.play().catch(function(){}); speak('Sound on'); }
+}
+function speak(t){
+  try{
+    if(!('speechSynthesis' in window)) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(t);
+    u.lang='bn-BD'; u.rate=1;
+    speechSynthesis.speak(u);
+  }catch(e){}
+}
+function notifyPayment(p){
+  if(!soundOn) return;
+  ensureAudio();
+  try{ audioEl.currentTime=0; audioEl.play().catch(function(){}); }catch(e){}
+  speak('Payment eseche. ' + fmtAmt(p.amount) + ' taka.');
+}
+paintSoundBtn();
 function refresh(){loadStats();load();loadDaily();}
 refresh(); setInterval(refresh,15000);
 </script>
