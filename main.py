@@ -9,6 +9,7 @@ Retention: 2 months — purono data auto delete hoye jay.
 import os
 import re
 import hmac
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -60,6 +61,12 @@ def db():
                sender_name TEXT,
                sms_body TEXT,
                received_at TEXT,
+               created_at TIMESTAMPTZ DEFAULT now()
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS sessions (
+               token TEXT PRIMARY KEY,
                created_at TIMESTAMPTZ DEFAULT now()
            )"""
     )
@@ -133,13 +140,26 @@ def parse_sms(sender: str, body: str):
     }
 
 
-def check_dashboard(creds: HTTPBasicCredentials = Depends(security)):
-    ok_user = hmac.compare_digest(creds.username, DASHBOARD_USER)
-    ok_pass = hmac.compare_digest(creds.password, DASHBOARD_PASS)
-    if not (ok_user and ok_pass):
-        raise HTTPException(status_code=401, detail="Login dorkar",
-                            headers={"WWW-Authenticate": "Basic"})
-    return creds.username
+def get_session_user(request: Request):
+    """Cookie theke login check — token 1 bochor valid."""
+    token = request.cookies.get("pw_session", "")
+    if not token:
+        return None
+    try:
+        conn = db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT token FROM sessions WHERE token = %s", (token,))
+            row = cur.fetchone()
+        conn.close()
+    except Exception:
+        return None
+    return DASHBOARD_USER if row else None
+
+
+def require_api(request: Request):
+    if not get_session_user(request):
+        raise HTTPException(status_code=401, detail="login dorkar")
+    return DASHBOARD_USER
 
 
 @app.post("/api/ingest")
@@ -178,7 +198,7 @@ async def ingest(req: Request):
 
 
 @app.get("/api/verify")
-def verify(trxid: str, user: str = Depends(check_dashboard)):
+def verify(trxid: str, user: str = Depends(require_api)):
     """Check from any device: has this TrxID's payment arrived?"""
     conn = db()
     try:
@@ -196,7 +216,7 @@ def verify(trxid: str, user: str = Depends(check_dashboard)):
 
 
 @app.get("/api/search_number")
-def search_number(number: str, user: str = Depends(check_dashboard)):
+def search_number(number: str, user: str = Depends(require_api)):
     """Sender number diye khujo — full number ba sesh koyek digit."""
     digits = re.sub(r"\D", "", number or "")
     if len(digits) < 3:
@@ -218,7 +238,7 @@ def search_number(number: str, user: str = Depends(check_dashboard)):
 
 
 @app.get("/api/latest")
-def latest(limit: int = 50, user: str = Depends(check_dashboard)):
+def latest(limit: int = 50, user: str = Depends(require_api)):
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -235,7 +255,7 @@ def latest(limit: int = 50, user: str = Depends(check_dashboard)):
 
 
 @app.get("/api/stats")
-def stats(user: str = Depends(check_dashboard)):
+def stats(user: str = Depends(require_api)):
     """Ajker + mot hisab (Dhaka time)."""
     today = datetime.now(DHAKA).date().isoformat()
     conn = db()
@@ -255,7 +275,7 @@ def stats(user: str = Depends(check_dashboard)):
 
 
 @app.get("/api/daily")
-def daily(user: str = Depends(check_dashboard)):
+def daily(user: str = Depends(require_api)):
     """Kon date e koto payment / koto taka (Dhaka time)."""
     conn = db()
     try:
@@ -272,7 +292,7 @@ def daily(user: str = Depends(check_dashboard)):
 
 
 @app.get("/api/monthly")
-def monthly(month: str, user: str = Depends(check_dashboard)):
+def monthly(month: str, user: str = Depends(require_api)):
     """Month select kore oi masher hisab: month=YYYY-MM."""
     if not re.fullmatch(r"\d{4}-\d{2}", month or ""):
         raise HTTPException(status_code=400, detail="month YYYY-MM format e dao")
@@ -383,7 +403,7 @@ tr:last-child td{border-bottom:0}
       <a href="#daily"><span class="ico">📅</span>Daily</a>
       <a href="#monthly"><span class="ico">🗓️</span>Monthly</a>
     </nav>
-    <div class="foot"><div class="avatar">A</div><div>admin<br><small style="color:var(--green)">● online</small></div></div>
+    <div class="foot"><div class="avatar">A</div><div>admin<br><small style="color:var(--green)">● online</small> · <a href="/logout" style="color:var(--mut);font-size:12px">Logout</a></div></div>
   </aside>
   <main class="main">
     <div class="top">
@@ -445,6 +465,11 @@ tr:last-child td{border-bottom:0}
   </main>
 </div>
 <script>
+async function api(p){
+  const r=await fetch(p);
+  if(r.status===401){location.href='/login';throw new Error('login');}
+  return r.json();
+}
 let tab='t';
 function setTab(x){
   tab=x;
@@ -464,13 +489,13 @@ async function doSearch(){
     const t=document.getElementById('q').value.trim();
     if(!t) return;
     box.innerHTML='<div class="hint">Khujtese...</div>';
-    const j=await (await fetch('/api/verify?trxid='+encodeURIComponent(t))).json();
+    const j=await api('/api/verify?trxid='+encodeURIComponent(t));
     box.innerHTML = j.found ? foundCard(j) : notFound('“'+esc(j.trxid)+'” — payment pai nai');
   } else {
     const t=document.getElementById('q').value.replace(/\D/g,'');
     if(t.length<3){box.innerHTML=notFound('Kom kore 3 digit dao');return;}
     box.innerHTML='<div class="hint">Khujtese...</div>';
-    const j=await (await fetch('/api/search_number?number='+encodeURIComponent(t))).json();
+    const j=await api('/api/search_number?number='+encodeURIComponent(t));
     if(!j.payments.length){box.innerHTML=notFound('Ei number theke payment pai nai');return;}
     box.innerHTML='<div class="found"><div class="tick">✓</div><div><div class="amt">'+j.payments.length+' ta payment paise</div><div class="meta">'+j.payments.slice(0,5).map(p=>'<span class="pill">'+esc(p.trxid)+'</span> '+fmtAmt(p.amount)+' Tk').join('<br>')+'</div></div></div>';
   }
@@ -485,7 +510,7 @@ function fmtAmt(a){return (a==null||a==='')?'–':Number(a).toLocaleString('en-U
 function fmtDate(iso){const m=/^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(iso||'');if(!m)return esc(iso);const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];return m[3]+' '+M[+m[2]-1]+' '+m[1];}
 async function loadStats(){
   try{
-    const j=await (await fetch('/api/stats')).json();
+    const j=await api('/api/stats');
     document.getElementById('stToday').textContent=j.today_count;
     document.getElementById('stAmt').textContent=fmtAmt(j.today_amount);
     document.getElementById('stTotal').textContent=j.total_count;
@@ -494,7 +519,7 @@ async function loadStats(){
 }
 async function load(){
   try{
-    const j=await (await fetch('/api/latest?limit=30')).json();
+    const j=await api('/api/latest?limit=30');
     const tb=document.getElementById('rows');
     document.getElementById('emptyRow').style.display=j.payments.length?'none':'block';
     tb.innerHTML=j.payments.map(p=>'<tr><td><span class="pill">'+esc(p.trxid)+'</span></td><td class="amtcell">'+fmtAmt(p.amount)+' Tk</td><td>'+esc(p.sender_number||'–')+'</td><td style="color:var(--mut)">'+esc(p.received_at)+'</td></tr>').join('');
@@ -510,7 +535,7 @@ document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')d
 document.getElementById('dateLine').textContent=new Date().toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
 async function loadDaily(){
   try{
-    const j=await (await fetch('/api/daily')).json();
+    const j=await api('/api/daily');
     const tb=document.getElementById('dayRows');
     document.getElementById('dayEmpty').style.display=j.days.length?'none':'block';
     tb.innerHTML=j.days.map(d=>'<tr><td>'+fmtDate(d.date)+'</td><td>'+d.count+' ta</td><td class="amtcell">'+fmtAmt(d.amount)+' Tk</td></tr>').join('');
@@ -555,7 +580,7 @@ async function loadMonthly(){
   const box=document.getElementById('mRes');
   if(!m){box.innerHTML=notFound('Month select koro');return;}
   box.innerHTML='<div class="hint">Khujtese...</div>';
-  const j=await (await fetch('/api/monthly?month='+encodeURIComponent(m))).json();
+  const j=await api('/api/monthly?month='+encodeURIComponent(m));
   const MN=['January','February','March','April','May','June','July','August','September','October','November','December'];
   const parts=m.split('-');
   let h='<div class="found"><div class="tick">\u09F3</div><div><div class="amt">'+fmtAmt(j.amount)+' Tk</div><div class="meta">'+MN[+parts[1]-1]+' '+parts[0]+' — '+j.count+' ta payment</div></div></div>';
@@ -575,9 +600,95 @@ refresh(); setInterval(refresh,15000);
 """
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard(user: str = Depends(check_dashboard)):
-    return DASH_HTML
+@app.get("/")
+def dashboard(request: Request):
+    if not get_session_user(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(DASH_HTML)
+
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="bn"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PayWatch — Login</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#D12053,#7E1236);padding:20px}
+.card{background:#fff;border-radius:20px;padding:36px 32px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.3);text-align:center}
+.mark{width:64px;height:64px;border-radius:18px;background:linear-gradient(135deg,#D12053,#7E1236);display:flex;align-items:center;justify-content:center;color:#fff;font-size:34px;font-weight:800;margin:0 auto 14px}
+h1{font-size:24px;margin-bottom:4px}
+p{color:#8B8E98;font-size:13px;margin-bottom:22px}
+input{width:100%;border:1.5px solid #ECECF0;border-radius:12px;padding:13px 15px;font-size:16px;margin-bottom:12px;outline:none}
+input:focus{border-color:#D12053}
+button{width:100%;border:0;background:#D12053;color:#fff;border-radius:12px;padding:14px;font-size:16px;font-weight:700;cursor:pointer}
+.err{color:#D12053;font-size:14px;margin-top:12px;min-height:20px}
+</style></head><body>
+<div class="card">
+<div class="mark">&#2547;</div>
+<h1>PayWatch</h1>
+<p>Login kore payment dashboard e dhuko</p>
+<input id="u" placeholder="Username" autocomplete="username">
+<input id="p" type="password" placeholder="Password" autocomplete="current-password">
+<button onclick="doLogin()">Login</button>
+<div class="err" id="e"></div>
+</div>
+<script>
+async function doLogin(){
+  const u=document.getElementById('u').value.trim();
+  const p=document.getElementById('p').value;
+  const e=document.getElementById('e');
+  if(!u||!p){e.textContent='Username + password dao';return;}
+  e.textContent='';
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+  if(r.ok){location.href='/';}
+  else{e.textContent='Vul username/password';}
+}
+document.getElementById('p').addEventListener('keydown',ev=>{if(ev.key==='Enter')doLogin();});
+</script></body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return LOGIN_HTML
+
+
+@app.post("/api/login")
+async def api_login(req: Request):
+    """Dashboard + alert app — duitar login ekhane. Cookie 1 bochor thake."""
+    data = await req.json()
+    ok_u = hmac.compare_digest(str(data.get("username", "")), DASHBOARD_USER)
+    ok_p = hmac.compare_digest(str(data.get("password", "")), DASHBOARD_PASS)
+    if not (ok_u and ok_p):
+        raise HTTPException(status_code=401, detail="vul login")
+    token = secrets.token_urlsafe(32)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO sessions (token) VALUES (%s)", (token,))
+        conn.commit()
+    finally:
+        conn.close()
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie("pw_session", token, max_age=365 * 24 * 3600,
+                    httponly=True, samesite="lax")
+    return resp
+
+
+@app.get("/logout")
+def logout(request: Request):
+    token = request.cookies.get("pw_session", "")
+    if token:
+        try:
+            conn = db()
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie("pw_session")
+    return resp
 
 
 @app.get("/api/health")
