@@ -2,23 +2,27 @@
 PayWatch server — receives bKash/Nagad/Rocket SMS from the SIM phone,
 parses TrxID + amount + sender, and serves a mobile dashboard so the
 user can check from any other device whether a payment arrived.
+
+Storage: Postgres (Supabase free tier) — records survive redeploys.
+Retention: 2 months — purono data auto delete hoye jay.
 """
 import os
 import re
 import hmac
-import sqlite3
-import html as html_lib
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import psycopg
+from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 BASE = Path(__file__).parent
 
-# Load server/.env (local run). On Cloud Run, real env vars win.
+# Load server/.env (local run). On Render, real env vars win.
 _env_file = BASE / ".env"
 if _env_file.exists():
     for line in _env_file.read_text().splitlines():
@@ -27,7 +31,7 @@ if _env_file.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-DB_PATH = os.environ.get("DB_PATH", str(BASE / "payments.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 DEVICE_SECRET = os.environ.get("DEVICE_SECRET", "")
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
@@ -36,31 +40,56 @@ DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
 # Only these SMS senders are trusted (official bKash / Nagad / Rocket IDs).
 ALLOWED_SENDERS = {"bkash", "16247", "nagad", "rocket", "16216"}
 
+# 2 masher purono data auto delete
+RETENTION_DAYS = 60
+
 TRX_RE = re.compile(r"TrxID\s*[:\-]?\s*([A-Za-z0-9]{6,})", re.I)
 AMT_RE = re.compile(r"Tk\.?\s*([\d,]+(?:\.\d{1,2})?)", re.I)
 FROM_RE = re.compile(r"from\s*(01\d{9})", re.I)
 
-app = FastAPI(title="PayWatch")
-(BASE / "static").mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
-security = HTTPBasic()
-
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL set koro")
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS payments (
                trxid TEXT PRIMARY KEY,
-               amount REAL,
+               amount DOUBLE PRECISION,
                sender_number TEXT,
                sender_name TEXT,
                sms_body TEXT,
                received_at TEXT,
-               created_at TEXT DEFAULT (datetime('now'))
+               created_at TIMESTAMPTZ DEFAULT now()
            )"""
     )
     return conn
+
+
+def cleanup_old(conn):
+    """2 masher purono record delete."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM payments WHERE created_at < %s", (cutoff,))
+
+
+@asynccontextmanager
+async def lifespan(app):
+    if DATABASE_URL:
+        try:
+            conn = db()
+            cleanup_old(conn)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+    yield
+
+
+app = FastAPI(title="PayWatch", lifespan=lifespan)
+(BASE / "static").mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
+security = HTTPBasic()
 
 
 def norm_sender(s: str) -> str:
@@ -130,16 +159,21 @@ async def ingest(req: Request):
         return {"ok": False, "reason": "no trxid found"}
 
     conn = db()
-    conn.execute(
-        """INSERT OR IGNORE INTO payments
-           (trxid, amount, sender_number, sender_name, sms_body, received_at)
-           VALUES (?,?,?,?,?,?)""",
-        (parsed["trxid"], parsed["amount"], parsed["sender_number"],
-         parsed["sender_name"], data.get("body", "")[:2000],
-         norm_time(data.get("received_at") or datetime.now().isoformat())),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO payments
+                   (trxid, amount, sender_number, sender_name, sms_body, received_at)
+                   VALUES (%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (trxid) DO NOTHING""",
+                (parsed["trxid"], parsed["amount"], parsed["sender_number"],
+                 parsed["sender_name"], data.get("body", "")[:2000],
+                 norm_time(data.get("received_at") or datetime.now().isoformat())),
+            )
+            cleanup_old(conn)
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True, "trxid": parsed["trxid"], "amount": parsed["amount"]}
 
 
@@ -147,9 +181,13 @@ async def ingest(req: Request):
 def verify(trxid: str, user: str = Depends(check_dashboard)):
     """Check from any device: has this TrxID's payment arrived?"""
     conn = db()
-    row = conn.execute("SELECT * FROM payments WHERE trxid = ?",
-                       (trxid.strip().upper(),)).fetchone()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM payments WHERE trxid = %s",
+                        (trxid.strip().upper(),))
+            row = cur.fetchone()
+    finally:
+        conn.close()
     if not row:
         return {"found": False, "trxid": trxid.strip().upper()}
     return {"found": True, "trxid": row["trxid"], "amount": row["amount"],
@@ -164,59 +202,101 @@ def search_number(number: str, user: str = Depends(check_dashboard)):
     if len(digits) < 3:
         raise HTTPException(status_code=400, detail="kom kore 3 digit dao")
     conn = db()
-    rows = conn.execute(
-        "SELECT trxid, amount, sender_number, sender_name, received_at "
-        "FROM payments WHERE sender_number LIKE ? "
-        "ORDER BY created_at DESC LIMIT 50",
-        (f"%{digits}%",)).fetchall()
-    rows = [dict(r) for r in rows]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT trxid, amount, sender_number, sender_name, received_at "
+                "FROM payments WHERE sender_number LIKE %s "
+                "ORDER BY created_at DESC LIMIT 50",
+                (f"%{digits}%",))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
     for r in rows:
         r["received_at"] = norm_time(r.get("received_at"))
-    conn.close()
     return {"payments": rows}
 
 
 @app.get("/api/latest")
 def latest(limit: int = 50, user: str = Depends(check_dashboard)):
     conn = db()
-    rows = conn.execute(
-        "SELECT trxid, amount, sender_number, sender_name, received_at "
-        "FROM payments ORDER BY created_at DESC LIMIT ?",
-        (max(1, min(limit, 200)),)).fetchall()
-    rows = [dict(r) for r in rows]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT trxid, amount, sender_number, sender_name, received_at "
+                "FROM payments ORDER BY created_at DESC LIMIT %s",
+                (max(1, min(limit, 200)),))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
     for r in rows:
         r["received_at"] = norm_time(r.get("received_at"))
-    conn.close()
     return {"payments": rows}
 
 
 @app.get("/api/stats")
 def stats(user: str = Depends(check_dashboard)):
     """Ajker + mot hisab (Dhaka time)."""
-    dhaka = timezone(timedelta(hours=6))
-    today = datetime.now(dhaka).date().isoformat()
+    today = datetime.now(DHAKA).date().isoformat()
     conn = db()
-    t = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
-        "WHERE date(created_at, '+6 hours') = ?", (today,)).fetchone()
-    tot = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments").fetchone()
-    conn.close()
-    return {"today_count": t[0], "today_amount": t[1],
-            "total_count": tot[0], "total_amount": tot[1]}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM payments "
+                "WHERE (created_at AT TIME ZONE 'Asia/Dhaka')::date = %s::date",
+                (today,))
+            t = cur.fetchone()
+            cur.execute("SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM payments")
+            tot = cur.fetchone()
+    finally:
+        conn.close()
+    return {"today_count": t["c"], "today_amount": float(t["s"]),
+            "total_count": tot["c"], "total_amount": float(tot["s"])}
 
 
 @app.get("/api/daily")
 def daily(user: str = Depends(check_dashboard)):
     """Kon date e koto payment / koto taka (Dhaka time)."""
     conn = db()
-    rows = conn.execute(
-        "SELECT date(created_at, '+6 hours') AS d, COUNT(*), "
-        "COALESCE(SUM(amount),0) FROM payments "
-        "GROUP BY d ORDER BY d DESC LIMIT 60").fetchall()
-    conn.close()
-    return {"days": [{"date": r[0], "count": r[1], "amount": r[2]}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT (created_at AT TIME ZONE 'Asia/Dhaka')::date AS d, "
+                "COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM payments "
+                "GROUP BY d ORDER BY d DESC LIMIT 60")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"days": [{"date": str(r["d"]), "count": r["c"], "amount": float(r["s"])}
                      for r in rows]}
+
+
+@app.get("/api/monthly")
+def monthly(month: str, user: str = Depends(check_dashboard)):
+    """Month select kore oi masher hisab: month=YYYY-MM."""
+    if not re.fullmatch(r"\d{4}-\d{2}", month or ""):
+        raise HTTPException(status_code=400, detail="month YYYY-MM format e dao")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM payments "
+                "WHERE to_char(created_at AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM') = %s",
+                (month,))
+            t = cur.fetchone()
+            cur.execute(
+                "SELECT (created_at AT TIME ZONE 'Asia/Dhaka')::date AS d, "
+                "COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM payments "
+                "WHERE to_char(created_at AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM') = %s "
+                "GROUP BY d ORDER BY d",
+                (month,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"month": month, "count": t["c"], "amount": float(t["s"]),
+            "days": [{"date": str(r["d"]), "count": r["c"], "amount": float(r["s"])}
+                     for r in rows]}
+
 
 
 DASH_HTML = """<!DOCTYPE html>
@@ -301,6 +381,7 @@ tr:last-child td{border-bottom:0}
       <a href="#search"><span class="ico">🔍</span>Search</a>
       <a href="#recent"><span class="ico">🕘</span>Recent</a>
       <a href="#daily"><span class="ico">📅</span>Daily</a>
+      <a href="#monthly"><span class="ico">🗓️</span>Monthly</a>
     </nav>
     <div class="foot"><div class="avatar">A</div><div>admin<br><small style="color:var(--green)">● online</small></div></div>
   </aside>
@@ -341,6 +422,16 @@ tr:last-child td{border-bottom:0}
         <tbody id="dayRows"></tbody>
       </table></div>
       <div class="empty" id="dayEmpty" style="display:none">Ekhono kono hisab nai</div>
+    </div>
+
+    <div class="card" id="monthly">
+      <h3>Masher hisab</h3>
+      <div class="hint">Month select kore dekho oi mashe koto dhuklo</div>
+      <div class="searchrow">
+        <input type="month" id="mPick">
+        <button onclick="loadMonthly()">Dekho</button>
+      </div>
+      <div class="result" id="mRes"></div>
     </div>
 
     <div class="card" id="recent">
@@ -459,6 +550,23 @@ function notifyPayment(p){
   speak('Payment eseche. ' + fmtAmt(p.amount) + ' taka.');
 }
 paintSoundBtn();
+async function loadMonthly(){
+  const m=document.getElementById('mPick').value;
+  const box=document.getElementById('mRes');
+  if(!m){box.innerHTML=notFound('Month select koro');return;}
+  box.innerHTML='<div class="hint">Khujtese...</div>';
+  const j=await (await fetch('/api/monthly?month='+encodeURIComponent(m))).json();
+  const MN=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const parts=m.split('-');
+  let h='<div class="found"><div class="tick">\u09F3</div><div><div class="amt">'+fmtAmt(j.amount)+' Tk</div><div class="meta">'+MN[+parts[1]-1]+' '+parts[0]+' — '+j.count+' ta payment</div></div></div>';
+  if(j.days.length){
+    h+='<div style="overflow-x:auto;margin-top:12px"><table><thead><tr><th>Date</th><th>Payment</th><th>Amount</th></tr></thead><tbody>'+
+       j.days.map(d=>'<tr><td>'+fmtDate(d.date)+'</td><td>'+d.count+' ta</td><td class="amtcell">'+fmtAmt(d.amount)+' Tk</td></tr>').join('')+
+       '</tbody></table></div>';
+  }
+  box.innerHTML=h;
+}
+(function(){const d=new Date();document.getElementById('mPick').value=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');loadMonthly();})();
 function refresh(){loadStats();load();loadDaily();}
 refresh(); setInterval(refresh,15000);
 </script>
