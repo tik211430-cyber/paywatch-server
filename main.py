@@ -64,6 +64,31 @@ def norm_sender(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+DHAKA = timezone(timedelta(hours=6))
+
+
+def norm_time(raw):
+    """Millis / ISO / purono string -> 'DD/MM/YYYY HH:MM' (Dhaka)."""
+    if not raw:
+        return datetime.now(DHAKA).strftime("%d/%m/%Y %H:%M")
+    s = str(raw).strip()
+    try:
+        if re.fullmatch(r"\d{10,13}", s):
+            ms = int(s)
+            if len(s) == 10:
+                ms *= 1000
+            dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(DHAKA)
+        else:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=DHAKA)
+            else:
+                dt = dt.astimezone(DHAKA)
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return s[:16]
+
+
 def parse_sms(sender: str, body: str):
     trx = TRX_RE.search(body or "")
     amt = AMT_RE.search(body or "")
@@ -108,7 +133,7 @@ async def ingest(req: Request):
            VALUES (?,?,?,?,?,?)""",
         (parsed["trxid"], parsed["amount"], parsed["sender_number"],
          parsed["sender_name"], data.get("body", "")[:2000],
-         data.get("received_at") or datetime.now().isoformat()),
+         norm_time(data.get("received_at") or datetime.now().isoformat())),
     )
     conn.commit()
     conn.close()
@@ -126,7 +151,7 @@ def verify(trxid: str, user: str = Depends(check_dashboard)):
         return {"found": False, "trxid": trxid.strip().upper()}
     return {"found": True, "trxid": row["trxid"], "amount": row["amount"],
             "sender_number": row["sender_number"],
-            "received_at": row["received_at"]}
+            "received_at": norm_time(row["received_at"])}
 
 
 @app.get("/api/search_number")
@@ -141,8 +166,11 @@ def search_number(number: str, user: str = Depends(check_dashboard)):
         "FROM payments WHERE sender_number LIKE ? "
         "ORDER BY created_at DESC LIMIT 50",
         (f"%{digits}%",)).fetchall()
+    rows = [dict(r) for r in rows]
+    for r in rows:
+        r["received_at"] = norm_time(r.get("received_at"))
     conn.close()
-    return {"payments": [dict(r) for r in rows]}
+    return {"payments": rows}
 
 
 @app.get("/api/latest")
@@ -152,8 +180,11 @@ def latest(limit: int = 50, user: str = Depends(check_dashboard)):
         "SELECT trxid, amount, sender_number, sender_name, received_at "
         "FROM payments ORDER BY created_at DESC LIMIT ?",
         (max(1, min(limit, 200)),)).fetchall()
+    rows = [dict(r) for r in rows]
+    for r in rows:
+        r["received_at"] = norm_time(r.get("received_at"))
     conn.close()
-    return {"payments": [dict(r) for r in rows]}
+    return {"payments": rows}
 
 
 @app.get("/api/stats")
@@ -170,6 +201,19 @@ def stats(user: str = Depends(check_dashboard)):
     conn.close()
     return {"today_count": t[0], "today_amount": t[1],
             "total_count": tot[0], "total_amount": tot[1]}
+
+
+@app.get("/api/daily")
+def daily(user: str = Depends(check_dashboard)):
+    """Kon date e koto payment / koto taka (Dhaka time)."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT date(created_at, '+6 hours') AS d, COUNT(*), "
+        "COALESCE(SUM(amount),0) FROM payments "
+        "GROUP BY d ORDER BY d DESC LIMIT 60").fetchall()
+    conn.close()
+    return {"days": [{"date": r[0], "count": r[1], "amount": r[2]}
+                     for r in rows]}
 
 
 DASH_HTML = """<!DOCTYPE html>
@@ -201,7 +245,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hind Siligu
 .live{display:inline-flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:9px 16px;font-size:13px;font-weight:600}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--green);animation:pulse 1.6s infinite;display:inline-block}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(30,158,87,.5)}70%{box-shadow:0 0 0 8px rgba(30,158,87,0)}100%{box-shadow:0 0 0 0 rgba(30,158,87,0)}}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:22px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:22px}
 .stat{background:var(--card);border-radius:18px;padding:20px;box-shadow:0 2px 10px rgba(20,20,40,.05);display:flex;gap:14px;align-items:center}
 .stat .ic{width:48px;height:48px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
 .stat small{color:var(--mut);font-size:13px}
@@ -240,7 +284,7 @@ tr:last-child td{border-bottom:0}
   .searchrow{flex-direction:column}
   .searchrow button{padding:13px}
 }
-@media(max-width:520px){.stats{grid-template-columns:1fr}}
+@media(max-width:520px){.stats{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
@@ -251,6 +295,7 @@ tr:last-child td{border-bottom:0}
       <a href="#" class="on"><span class="ico">📊</span>Dashboard</a>
       <a href="#search"><span class="ico">🔍</span>Search</a>
       <a href="#recent"><span class="ico">🕘</span>Recent</a>
+      <a href="#daily"><span class="ico">📅</span>Daily</a>
     </nav>
     <div class="foot"><div class="avatar">A</div><div>admin<br><small style="color:var(--green)">● online</small></div></div>
   </aside>
@@ -264,6 +309,7 @@ tr:last-child td{border-bottom:0}
       <div class="stat"><div class="ic" style="background:#EAF9F0">💰</div><div><small>Ajker Payment</small><b id="stToday">–</b><div class="sub">ta</div></div></div>
       <div class="stat"><div class="ic" style="background:#FDEAF0">৳</div><div><small>Ajker Amount</small><b id="stAmt">–</b><div class="sub">taka</div></div></div>
       <div class="stat"><div class="ic" style="background:#EEF2FF">📦</div><div><small>Mot Payment</small><b id="stTotal">–</b><div class="sub">ta</div></div></div>
+      <div class="stat"><div class="ic" style="background:#FFF7E6">💵</div><div><small>Mot Amount</small><b id="stTotAmt">–</b><div class="sub">taka</div></div></div>
     </div>
 
     <div class="card" id="search">
@@ -278,6 +324,15 @@ tr:last-child td{border-bottom:0}
         <button onclick="doSearch()">Check</button>
       </div>
       <div class="result" id="res"></div>
+    </div>
+
+    <div class="card" id="daily">
+      <div class="sec-head"><h3>Din onujayi hisab</h3><span class="tag">kon date e koto</span></div>
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>Date</th><th>Payment</th><th>Amount</th></tr></thead>
+        <tbody id="dayRows"></tbody>
+      </table></div>
+      <div class="empty" id="dayEmpty" style="display:none">Ekhono kono hisab nai</div>
     </div>
 
     <div class="card" id="recent">
@@ -328,13 +383,14 @@ function notFound(msg){
   return '<div class="notfound"><div class="cross">✕</div><div><b>Payment pai nai</b><div class="meta">'+msg+'</div></div></div>';
 }
 function fmtAmt(a){return (a==null||a==='')?'–':Number(a).toLocaleString('en-US')}
-function fmtTime(s){if(!s) return '–';const d=new Date(s);return isNaN(d)?String(s).slice(0,16):d.toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}
+function fmtDate(iso){const m=/^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(iso||'');if(!m)return esc(iso);const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];return m[3]+' '+M[+m[2]-1]+' '+m[1];}
 async function loadStats(){
   try{
     const j=await (await fetch('/api/stats')).json();
     document.getElementById('stToday').textContent=j.today_count;
     document.getElementById('stAmt').textContent=fmtAmt(j.today_amount);
     document.getElementById('stTotal').textContent=j.total_count;
+    document.getElementById('stTotAmt').textContent=fmtAmt(j.total_amount);
   }catch(e){}
 }
 async function load(){
@@ -342,12 +398,20 @@ async function load(){
     const j=await (await fetch('/api/latest?limit=30')).json();
     const tb=document.getElementById('rows');
     document.getElementById('emptyRow').style.display=j.payments.length?'none':'block';
-    tb.innerHTML=j.payments.map(p=>'<tr><td><span class="pill">'+esc(p.trxid)+'</span></td><td class="amtcell">'+fmtAmt(p.amount)+' Tk</td><td>'+esc(p.sender_number||'–')+'</td><td style="color:var(--mut)">'+fmtTime(p.received_at)+'</td></tr>').join('');
+    tb.innerHTML=j.payments.map(p=>'<tr><td><span class="pill">'+esc(p.trxid)+'</span></td><td class="amtcell">'+fmtAmt(p.amount)+' Tk</td><td>'+esc(p.sender_number||'–')+'</td><td style="color:var(--mut)">'+esc(p.received_at)+'</td></tr>').join('');
   }catch(e){}
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
 document.getElementById('dateLine').textContent=new Date().toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
-function refresh(){loadStats();load();}
+async function loadDaily(){
+  try{
+    const j=await (await fetch('/api/daily')).json();
+    const tb=document.getElementById('dayRows');
+    document.getElementById('dayEmpty').style.display=j.days.length?'none':'block';
+    tb.innerHTML=j.days.map(d=>'<tr><td>'+fmtDate(d.date)+'</td><td>'+d.count+' ta</td><td class="amtcell">'+fmtAmt(d.amount)+' Tk</td></tr>').join('');
+  }catch(e){}
+}
+function refresh(){loadStats();load();loadDaily();}
 refresh(); setInterval(refresh,15000);
 </script>
 </body>
