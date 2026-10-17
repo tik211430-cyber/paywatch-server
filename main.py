@@ -8,7 +8,7 @@ import re
 import hmac
 import sqlite3
 import html as html_lib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -156,62 +156,203 @@ def latest(limit: int = 50, user: str = Depends(check_dashboard)):
     return {"payments": [dict(r) for r in rows]}
 
 
-DASH_HTML = """<!DOCTYPE html><html lang="bn"><head><meta charset="utf-8">
+@app.get("/api/stats")
+def stats(user: str = Depends(check_dashboard)):
+    """Ajker + mot hisab (Dhaka time)."""
+    dhaka = timezone(timedelta(hours=6))
+    today = datetime.now(dhaka).date().isoformat()
+    conn = db()
+    t = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
+        "WHERE date(created_at, '+6 hours') = ?", (today,)).fetchone()
+    tot = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments").fetchone()
+    conn.close()
+    return {"today_count": t[0], "today_amount": t[1],
+            "total_count": tot[0], "total_amount": tot[1]}
+
+
+DASH_HTML = """<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PayWatch — Payment Check</title>
+<title>PayWatch — Dashboard</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:0;padding:12px;background:#f4f4f4}
-h2{margin:6px 0}.box{background:#fff;border-radius:10px;padding:12px;margin:10px 0}
-input{width:100%;padding:12px;font-size:17px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box}
-button{width:100%;padding:12px;font-size:17px;margin-top:8px;border:0;border-radius:8px;background:#d12053;color:#fff}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--pink:#D12053;--bg:#F3F4F6;--card:#fff;--ink:#16181D;--mut:#8B8E98;--green:#1E9E57;--line:#ECECF0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hind Siliguri",sans-serif;background:var(--bg);color:var(--ink);min-height:100vh}
+.app{display:flex;min-height:100vh}
+.side{width:230px;background:var(--card);border-right:1px solid var(--line);padding:26px 16px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:12px;padding:2px 10px 22px}
+.brand .mark{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,var(--pink),#7E1236);display:flex;align-items:center;justify-content:center;color:#fff;font-size:24px;font-weight:800;box-shadow:0 6px 14px rgba(209,32,83,.35)}
+.brand b{font-size:20px}
+.brand small{display:block;font-size:11px;color:var(--mut);font-weight:400}
+.nav{display:flex;flex-direction:column;gap:4px}
+.nav a{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:12px;color:#5A5E6A;text-decoration:none;font-size:15px;font-weight:500}
+.nav a.on{background:#FDEAF0;color:var(--pink);font-weight:700}
+.nav .ico{width:20px;text-align:center}
+.side .foot{margin-top:auto;padding:12px;border-top:1px solid var(--line);font-size:13px;color:var(--mut);display:flex;align-items:center;gap:10px}
+.avatar{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,#D12053,#7E1236);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0}
+.main{flex:1;padding:30px 32px;max-width:1080px;width:100%}
+.top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;flex-wrap:wrap;gap:10px}
+.top h1{font-size:26px;font-weight:800}
+.top p{color:var(--mut);font-size:14px;margin-top:4px}
+.live{display:inline-flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:9px 16px;font-size:13px;font-weight:600}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--green);animation:pulse 1.6s infinite;display:inline-block}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(30,158,87,.5)}70%{box-shadow:0 0 0 8px rgba(30,158,87,0)}100%{box-shadow:0 0 0 0 rgba(30,158,87,0)}}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:22px}
+.stat{background:var(--card);border-radius:18px;padding:20px;box-shadow:0 2px 10px rgba(20,20,40,.05);display:flex;gap:14px;align-items:center}
+.stat .ic{width:48px;height:48px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
+.stat small{color:var(--mut);font-size:13px}
+.stat b{font-size:24px;display:block;margin-top:2px}
+.stat .sub{font-size:12px;color:var(--mut)}
+.card{background:var(--card);border-radius:18px;padding:22px;box-shadow:0 2px 10px rgba(20,20,40,.05);margin-bottom:22px}
+.card h3{font-size:17px;margin-bottom:4px}
+.card .hint{font-size:13px;color:var(--mut);margin-bottom:14px}
+.tabs{display:flex;gap:8px;margin-bottom:14px}
+.tabs button{border:0;background:#F0F1F4;color:#5A5E6A;padding:10px 18px;border-radius:999px;font-size:14px;font-weight:600;cursor:pointer}
+.tabs button.on{background:var(--pink);color:#fff}
+.searchrow{display:flex;gap:10px}
+.searchrow input{flex:1;border:1.5px solid var(--line);border-radius:12px;padding:13px 15px;font-size:16px;outline:none;min-width:0}
+.searchrow input:focus{border-color:var(--pink)}
+.searchrow button{border:0;background:var(--pink);color:#fff;border-radius:12px;padding:0 26px;font-size:15px;font-weight:700;cursor:pointer}
+.result{margin-top:16px}
+.found{background:#EAF9F0;border:1px solid #BDE8CC;border-radius:14px;padding:16px;display:flex;gap:14px;align-items:center}
+.found .tick{width:44px;height:44px;border-radius:50%;background:var(--green);color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
+.notfound{background:#FDEEF2;border:1px solid #F6C9D6;border-radius:14px;padding:16px;display:flex;gap:14px;align-items:center}
+.notfound .cross{width:44px;height:44px;border-radius:50%;background:var(--pink);color:#fff;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+.result .amt{font-size:22px;font-weight:800}
+.result .meta{font-size:13px;color:var(--mut);margin-top:4px;line-height:1.9}
 table{width:100%;border-collapse:collapse;font-size:14px}
-td,th{border-bottom:1px solid #eee;padding:8px 4px;text-align:left}
-.ok{color:green;font-weight:bold}.no{color:#d12053;font-weight:bold}
-.small{font-size:12px;color:#666}
-</style></head><body>
-<h2>&#128176; PayWatch</h2>
-<div class="box">
-<input id="q" placeholder="TrxID likho (jemon: 9HXK2LMN4P)" autocomplete="off">
-<button onclick="check()">Check koro</button>
-<div id="res" style="margin-top:10px;font-size:18px"></div>
-</div>
-<div class="box">
-<b>Number diye khujo</b>
-<input id="n" placeholder="Full number ba sesh koyek digit (jemon: 45678)" inputmode="numeric" autocomplete="off">
-<button onclick="searchNum()">Number diye khujo</button>
-<div id="nres" style="margin-top:10px"></div>
-</div>
-<div class="box"><b>Sesh payment gula</b> <span class="small">(auto refresh)</span>
-<table><thead><tr><th>TrxID</th><th>Tk</th><th>Number</th><th>Time</th></tr></thead>
-<tbody id="rows"></tbody></table></div>
-<script>
-async function check(){
-  const t=document.getElementById('q').value.trim();
-  if(!t) return;
-  const r=await fetch('/api/verify?trxid='+encodeURIComponent(t));
-  const j=await r.json();
-  document.getElementById('res').innerHTML = j.found
-    ? '<span class="ok">&#10003; TK DHUKSE</span> — '+j.trxid+' : '+j.amount+' Tk<br><span class="small">'+(j.sender_number||'')+' | '+j.received_at+'</span>'
-    : '<span class="no">&#10007; PAYMENT PAI NAI</span> — '+j.trxid;
+th{text-align:left;color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px;padding:10px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:13px 8px;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+.pill{display:inline-block;background:#F0F1F4;border-radius:8px;padding:4px 10px;font-family:ui-monospace,monospace;font-size:13px;white-space:nowrap}
+.amtcell{font-weight:700;white-space:nowrap}
+.empty{color:var(--mut);text-align:center;padding:26px;font-size:14px}
+.sec-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.sec-head .tag{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:6px}
+@media(max-width:860px){
+  .side{display:none}
+  .main{padding:18px 14px}
+  .stats{grid-template-columns:1fr 1fr}
+  .searchrow{flex-direction:column}
+  .searchrow button{padding:13px}
 }
-async function searchNum(){
-  const t=document.getElementById('n').value.replace(/\D/g,'');
-  const box=document.getElementById('nres');
-  if(t.length<3){box.innerHTML='<span class="no">Kom kore 3 digit dao</span>';return;}
-  box.innerHTML='<span class="small">Khujtese...</span>';
-  const r=await fetch('/api/search_number?number='+encodeURIComponent(t));
-  const j=await r.json();
-  if(!j.payments.length){box.innerHTML='<span class="no">&#10007; EI NUMBER THEKE PAYMENT PAI NAI</span>';return;}
-  box.innerHTML='<span class="ok">&#10003; '+j.payments.length+' ta payment paise</span><table>'+
-    j.payments.map(p=>'<tr><td>'+p.trxid+'</td><td>'+(p.amount??'')+' Tk</td><td>'+(p.sender_number||'')+'</td><td class="small">'+(p.received_at||'').slice(5,16)+'</td></tr>').join('')+'</table>';
+@media(max-width:520px){.stats{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><div class="mark">৳</div><div><b>PayWatch</b><small>Payment tracker</small></div></div>
+    <nav class="nav">
+      <a href="#" class="on"><span class="ico">📊</span>Dashboard</a>
+      <a href="#search"><span class="ico">🔍</span>Search</a>
+      <a href="#recent"><span class="ico">🕘</span>Recent</a>
+    </nav>
+    <div class="foot"><div class="avatar">A</div><div>admin<br><small style="color:var(--green)">● online</small></div></div>
+  </aside>
+  <main class="main">
+    <div class="top">
+      <div><h1>Payment Dashboard</h1><p id="dateLine">—</p></div>
+      <div class="live"><span class="dot"></span> LIVE</div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="ic" style="background:#EAF9F0">💰</div><div><small>Ajker Payment</small><b id="stToday">–</b><div class="sub">ta</div></div></div>
+      <div class="stat"><div class="ic" style="background:#FDEAF0">৳</div><div><small>Ajker Amount</small><b id="stAmt">–</b><div class="sub">taka</div></div></div>
+      <div class="stat"><div class="ic" style="background:#EEF2FF">📦</div><div><small>Mot Payment</small><b id="stTotal">–</b><div class="sub">ta</div></div></div>
+    </div>
+
+    <div class="card" id="search">
+      <h3>Payment khujo</h3>
+      <div class="hint">TrxID ba sender number diye check koro</div>
+      <div class="tabs">
+        <button id="tabT" class="on" onclick="setTab('t')">TrxID</button>
+        <button id="tabN" onclick="setTab('n')">Number</button>
+      </div>
+      <div class="searchrow">
+        <input id="q" placeholder="TrxID likho — jemon 9HXK2LMN4P" autocomplete="off">
+        <button onclick="doSearch()">Check</button>
+      </div>
+      <div class="result" id="res"></div>
+    </div>
+
+    <div class="card" id="recent">
+      <div class="sec-head"><h3>Sesh payment gula</h3><span class="tag"><span class="dot"></span>auto refresh</span></div>
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>TrxID</th><th>Amount</th><th>Number</th><th>Time</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table></div>
+      <div class="empty" id="emptyRow" style="display:none">Ekhono kono payment ashe nai</div>
+    </div>
+  </main>
+</div>
+<script>
+let tab='t';
+function setTab(x){
+  tab=x;
+  document.getElementById('tabT').className = x=='t'?'on':'';
+  document.getElementById('tabN').className = x=='n'?'on':'';
+  const q=document.getElementById('q');
+  q.value='';
+  q.placeholder = x=='t' ? 'TrxID likho — jemon 9HXK2LMN4P' : 'Full number ba sesh digit — jemon 45678';
+  q.inputMode = x=='n' ? 'numeric' : 'text';
+  document.getElementById('res').innerHTML='';
+  q.focus();
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function doSearch(){
+  const box=document.getElementById('res');
+  if(tab=='t'){
+    const t=document.getElementById('q').value.trim();
+    if(!t) return;
+    box.innerHTML='<div class="hint">Khujtese...</div>';
+    const j=await (await fetch('/api/verify?trxid='+encodeURIComponent(t))).json();
+    box.innerHTML = j.found ? foundCard(j) : notFound('“'+esc(j.trxid)+'” — payment pai nai');
+  } else {
+    const t=document.getElementById('q').value.replace(/\D/g,'');
+    if(t.length<3){box.innerHTML=notFound('Kom kore 3 digit dao');return;}
+    box.innerHTML='<div class="hint">Khujtese...</div>';
+    const j=await (await fetch('/api/search_number?number='+encodeURIComponent(t))).json();
+    if(!j.payments.length){box.innerHTML=notFound('Ei number theke payment pai nai');return;}
+    box.innerHTML='<div class="found"><div class="tick">✓</div><div><div class="amt">'+j.payments.length+' ta payment paise</div><div class="meta">'+j.payments.slice(0,5).map(p=>'<span class="pill">'+esc(p.trxid)+'</span> '+fmtAmt(p.amount)+' Tk').join('<br>')+'</div></div></div>';
+  }
+}
+function foundCard(j){
+  return '<div class="found"><div class="tick">✓</div><div><div class="amt">'+fmtAmt(j.amount)+' Tk dhukse ✓</div><div class="meta"><span class="pill">'+esc(j.trxid)+'</span> &nbsp;'+esc(j.sender_number||'')+'<br>'+esc(j.received_at||'')+'</div></div></div>';
+}
+function notFound(msg){
+  return '<div class="notfound"><div class="cross">✕</div><div><b>Payment pai nai</b><div class="meta">'+msg+'</div></div></div>';
+}
+function fmtAmt(a){return (a==null||a==='')?'–':Number(a).toLocaleString('en-US')}
+function fmtTime(s){if(!s) return '–';const d=new Date(s);return isNaN(d)?String(s).slice(0,16):d.toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}
+async function loadStats(){
+  try{
+    const j=await (await fetch('/api/stats')).json();
+    document.getElementById('stToday').textContent=j.today_count;
+    document.getElementById('stAmt').textContent=fmtAmt(j.today_amount);
+    document.getElementById('stTotal').textContent=j.total_count;
+  }catch(e){}
 }
 async function load(){
-  const r=await fetch('/api/latest?limit=30'); const j=await r.json();
-  document.getElementById('rows').innerHTML=j.payments.map(p=>
-    '<tr><td>'+p.trxid+'</td><td>'+(p.amount??'')+'</td><td>'+(p.sender_number||'')+'</td><td class="small">'+(p.received_at||'').slice(5,16)+'</td></tr>').join('');
+  try{
+    const j=await (await fetch('/api/latest?limit=30')).json();
+    const tb=document.getElementById('rows');
+    document.getElementById('emptyRow').style.display=j.payments.length?'none':'block';
+    tb.innerHTML=j.payments.map(p=>'<tr><td><span class="pill">'+esc(p.trxid)+'</span></td><td class="amtcell">'+fmtAmt(p.amount)+' Tk</td><td>'+esc(p.sender_number||'–')+'</td><td style="color:var(--mut)">'+fmtTime(p.received_at)+'</td></tr>').join('');
+  }catch(e){}
 }
-load(); setInterval(load,15000);
-</script></body></html>"""
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+document.getElementById('dateLine').textContent=new Date().toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+function refresh(){loadStats();load();}
+refresh(); setInterval(refresh,15000);
+</script>
+</body>
+</html>
+"""
 
 
 @app.get("/", response_class=HTMLResponse)
